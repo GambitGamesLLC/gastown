@@ -285,6 +285,10 @@ func (b *Beads) CreateOrReopenAgentBead(id, title string, fields *AgentFields) (
 		return nil, fmt.Errorf("updating agent bead: %w", err)
 	}
 	// Fix type separately — UpdateOptions doesn't support type changes
+	// Ensure custom types are configured for target database (gt-fix: agent type not recognized)
+	if err := EnsureCustomTypes(targetDir); err != nil {
+		return nil, fmt.Errorf("preparing target for agent type fix: %w", err)
+	}
 	if _, err := target.run("update", id, "--type=agent"); err != nil {
 		return nil, fmt.Errorf("fixing agent bead type: %w", err)
 	}
