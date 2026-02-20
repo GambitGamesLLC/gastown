@@ -783,7 +783,7 @@ func (d *Daemon) ensureWitnessRunning(rigName string) {
 	if status := mgr.IsHealthy(hungSessionThreshold); status == tmux.AgentHung {
 		d.logger.Printf("Witness for %s is hung (no activity for %v), killing for restart", rigName, hungSessionThreshold)
 		t := tmux.NewTmux()
-		_ = t.KillSession(mgr.SessionName())
+		_ = t.KillSessionWithProcesses(mgr.SessionName())
 	}
 
 	if err := mgr.Start(false, "", nil); err != nil {
@@ -833,7 +833,7 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	if status := mgr.IsHealthy(hungSessionThreshold); status == tmux.AgentHung {
 		d.logger.Printf("Refinery for %s is hung (no activity for %v), killing for restart", rigName, hungSessionThreshold)
 		t := tmux.NewTmux()
-		_ = t.KillSession(mgr.SessionName())
+		_ = t.KillSessionWithProcesses(mgr.SessionName())
 	}
 
 	if err := mgr.Start(false, ""); err != nil {
@@ -919,7 +919,7 @@ func (d *Daemon) openBeadsStores() map[string]beadsdk.Storage {
 
 	// Town-level store (hq)
 	hqBeadsDir := filepath.Join(d.config.TownRoot, ".beads")
-	if store, err := beadsdk.OpenFromConfig(d.ctx, hqBeadsDir); err == nil {
+	if store, err := beadsdk.Open(d.ctx, hqBeadsDir); err == nil {
 		stores["hq"] = store
 	} else {
 		d.logger.Printf("Convoy: hq beads store unavailable: %s", util.FirstLine(err.Error()))
@@ -931,7 +931,7 @@ func (d *Daemon) openBeadsStores() map[string]beadsdk.Storage {
 		if beadsDir == "" {
 			continue
 		}
-		store, err := beadsdk.OpenFromConfig(d.ctx, beadsDir)
+		store, err := beadsdk.Open(d.ctx, beadsDir)
 		if err != nil {
 			d.logger.Printf("Convoy: %s beads store unavailable: %s", rigName, util.FirstLine(err.Error()))
 			continue
@@ -1461,6 +1461,33 @@ func (d *Daemon) checkPolecatHealth(rigName, polecatName string) {
 		return
 	}
 
+	// Spawning guard: skip polecats being actively started by gt sling.
+	// agent_state='spawning' means the polecat bead was created (with hook_bead
+	// set atomically) but the tmux session hasn't been launched yet. Restarting
+	// here would create a second Claude process alongside the one gt sling is
+	// about to start, causing the double-spawn bug (issue #1752).
+	//
+	// Time-bound: only skip if the bead was updated recently (within 5 minutes).
+	// If gt sling crashed during spawn, the polecat would be stuck in 'spawning'
+	// indefinitely. The Witness patrol also catches spawning-as-zombie, but a
+	// time-bound here makes the daemon self-sufficient for this edge case.
+	if info.State == "spawning" {
+		if updatedAt, err := time.Parse(time.RFC3339, info.LastUpdate); err == nil {
+			if time.Since(updatedAt) < 5*time.Minute {
+				d.logger.Printf("Skipping restart for %s/%s: agent_state=spawning (gt sling in progress, updated %s ago)",
+					rigName, polecatName, time.Since(updatedAt).Round(time.Second))
+				return
+			}
+			d.logger.Printf("Spawning guard expired for %s/%s: agent_state=spawning but last updated %s ago (>5m), proceeding with crash detection",
+				rigName, polecatName, time.Since(updatedAt).Round(time.Second))
+		} else {
+			// Can't parse timestamp — be safe, skip restart during spawning
+			d.logger.Printf("Skipping restart for %s/%s: agent_state=spawning (gt sling in progress, unparseable updated_at)",
+				rigName, polecatName)
+			return
+		}
+	}
+
 	// TOCTOU guard: re-verify session is still dead before restarting.
 	// Between the initial check and now, the session may have been restarted
 	// by another heartbeat cycle, witness, or the polecat itself.
@@ -1569,12 +1596,18 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 		return fmt.Errorf("creating session: %w", err)
 	}
 
-	// Set environment variables using centralized AgentEnv
+	// Resolve agent config for GT_AGENT fallback and process name detection.
+	rc := config.ResolveRoleAgentConfig("polecat", d.config.TownRoot, rigPath)
+
+	// Set environment variables using centralized AgentEnv.
+	// ResolvedAgent ensures GT_AGENT is in the tmux session table even without
+	// an explicit --agent override, so IsAgentAlive detects non-Claude agents.
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:      "polecat",
-		Rig:       rigName,
-		AgentName: polecatName,
-		TownRoot:  d.config.TownRoot,
+		Role:          "polecat",
+		Rig:           rigName,
+		AgentName:     polecatName,
+		TownRoot:      d.config.TownRoot,
+		ResolvedAgent: rc.ResolvedAgent,
 	})
 
 	// Set all env vars in tmux session (for debugging) and they'll also be exported to Claude
@@ -1582,14 +1615,9 @@ func (d *Daemon) restartPolecatSession(rigName, polecatName, sessionName string)
 		_ = d.tmux.SetEnvironment(sessionName, k, v)
 	}
 
-	// Set GT_AGENT in tmux session env so tools querying tmux environment
-	// (e.g., witness patrol) can detect non-Claude agents.
-	// BuildStartupCommand sets GT_AGENT in process env via exec env, but that
-	// isn't visible to tmux show-environment.
-	rc := config.ResolveRoleAgentConfig("polecat", d.config.TownRoot, rigPath)
-	if rc.ResolvedAgent != "" {
-		_ = d.tmux.SetEnvironment(sessionName, "GT_AGENT", rc.ResolvedAgent)
-	}
+	// Set GT_PROCESS_NAMES for accurate liveness detection of custom agents.
+	processNames := config.ResolveProcessNames(rc.ResolvedAgent, rc.Command)
+	_ = d.tmux.SetEnvironment(sessionName, "GT_PROCESS_NAMES", strings.Join(processNames, ","))
 
 	// Apply theme
 	theme := tmux.AssignTheme(rigName)

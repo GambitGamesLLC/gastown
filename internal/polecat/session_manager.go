@@ -73,6 +73,11 @@ type SessionStartOptions struct {
 	// DoltBranch is the polecat-specific Dolt branch for write isolation.
 	// If set, BD_BRANCH env var is injected into the polecat session.
 	DoltBranch string
+
+	// Agent is the agent override for this polecat session (e.g., "codex", "gemini").
+	// If set, GT_AGENT is written to the tmux session environment table so that
+	// IsAgentAlive and waitForPolecatReady read the correct process names.
+	Agent string
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -308,6 +313,8 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		AgentName:        polecat,
 		TownRoot:         townRoot,
 		RuntimeConfigDir: opts.RuntimeConfigDir,
+		Agent:            opts.Agent,
+		ResolvedAgent:    runtimeConfig.ResolvedAgent,
 	})
 	for k, v := range envVars {
 		debugSession("SetEnvironment "+k, m.tmux.SetEnvironment(sessionID, k, v))
@@ -331,13 +338,11 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// This ensures respawned processes also inherit the setting.
 	debugSession("SetEnvironment BD_DOLT_AUTO_COMMIT", m.tmux.SetEnvironment(sessionID, "BD_DOLT_AUTO_COMMIT", "off"))
 
-	// Set GT_AGENT in tmux session environment so IsAgentAlive can detect
-	// the running process. BuildStartupCommand sets it via exec env (process env),
-	// but IsAgentAlive reads from tmux show-environment (session env).
-	if runtimeConfig.ResolvedAgent != "" {
-		debugSession("SetEnvironment GT_AGENT", m.tmux.SetEnvironment(sessionID, "GT_AGENT", runtimeConfig.ResolvedAgent))
-	}
-
+	// Set GT_PROCESS_NAMES for accurate liveness detection. Custom agents may
+	// shadow built-in preset names (e.g., custom "codex" running "opencode"),
+	// so we resolve process names from both agent name and actual command.
+	processNames := config.ResolveProcessNames(runtimeConfig.ResolvedAgent, runtimeConfig.Command)
+	debugSession("SetEnvironment GT_PROCESS_NAMES", m.tmux.SetEnvironment(sessionID, "GT_PROCESS_NAMES", strings.Join(processNames, ",")))
 	// Hook the issue to the polecat if provided via --issue flag
 	if opts.Issue != "" {
 		agentID := fmt.Sprintf("%s/polecats/%s", m.rig.Name, polecat)
@@ -360,8 +365,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Accept bypass permissions warning dialog if it appears
 	debugSession("AcceptBypassPermissionsWarning", m.tmux.AcceptBypassPermissionsWarning(sessionID))
 
-	// Wait for runtime to be fully ready at the prompt (not just started)
-	runtime.SleepForReadyDelay(runtimeConfig)
+	// Wait for runtime to be fully ready at the prompt (not just started).
+	// Uses prompt-detection polling when ReadyPromptPrefix is configured;
+	// falls back to fixed ReadyDelayMs for agents without prompt detection.
+	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.

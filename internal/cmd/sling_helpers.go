@@ -16,7 +16,6 @@ import (
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -77,6 +76,22 @@ type beadInfo struct {
 	Assignee     string          `json:"assignee"`
 	Description  string          `json:"description"`
 	Dependencies []beads.IssueDep `json:"dependencies,omitempty"`
+}
+
+// isDeferredBead checks whether a bead should be rejected from slinging because
+// it has been deferred. Returns true if the bead has status "deferred" or if its
+// description contains deferral keywords like "deferred to post-launch".
+func isDeferredBead(info *beadInfo) bool {
+	if info.Status == "deferred" {
+		return true
+	}
+	desc := strings.ToLower(info.Description)
+	if strings.Contains(desc, "deferred to post-launch") ||
+		strings.Contains(desc, "deferred to post launch") ||
+		strings.Contains(desc, "status: deferred") {
+		return true
+	}
+	return false
 }
 
 // collectExistingMolecules returns all molecule wisp IDs attached to a bead.
@@ -220,6 +235,7 @@ type beadFieldUpdates struct {
 	Mode             string // Execution mode: "" (normal) or "ralph"
 	ConvoyID         string // Convoy bead ID (e.g., "hq-cv-abc")
 	MergeStrategy    string // Convoy merge strategy: "direct", "mr", "local"
+	ConvoyOwned      bool   // Convoy has gt:owned label (caller-managed lifecycle)
 }
 
 // storeFieldsInBead performs a single read-modify-write to update all attachment fields
@@ -282,6 +298,9 @@ func storeFieldsInBead(beadID string, updates beadFieldUpdates) error {
 	}
 	if updates.MergeStrategy != "" {
 		fields.MergeStrategy = updates.MergeStrategy
+	}
+	if updates.ConvoyOwned {
+		fields.ConvoyOwned = true
 	}
 
 	// Write back once
@@ -368,8 +387,9 @@ func ensureAgentReady(sessionName string) error {
 		}
 		// Fall through to apply startup delay for young sessions.
 	} else {
-		// Agent not running yet - wait for it to start (shell → program transition)
-		if err := t.WaitForCommand(sessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+		// Agent not running yet - wait for it to start (shell → program transition).
+		// Uses exponential backoff: 100ms, 200ms, 400ms, ... capped at 5s per retry.
+		if err := waitForAgentWithBackoff(t, sessionName, constants.ClaudeStartTimeout); err != nil {
 			return fmt.Errorf("waiting for agent to start: %w", err)
 		}
 	}
@@ -426,6 +446,40 @@ func isSessionYoung(sessionName string, maxAge time.Duration) bool {
 		return false
 	}
 	return time.Since(time.Unix(createdUnix, 0)) < maxAge
+}
+
+// waitForAgentWithBackoff polls until the pane is no longer running a shell
+// (indicating the agent has started), using exponential backoff between retries.
+// Retry delays: 100ms, 200ms, 400ms, ... capped at 5s per retry.
+// Returns nil when the agent is detected, or an error if timeout expires.
+func waitForAgentWithBackoff(t *tmux.Tmux, sessionName string, timeout time.Duration) error {
+	const (
+		initialDelay = 100 * time.Millisecond
+		maxDelay     = 5 * time.Second
+	)
+	deadline := time.Now().Add(timeout)
+	delay := initialDelay
+	for time.Now().Before(deadline) {
+		cmd, err := t.GetPaneCommand(sessionName)
+		if err == nil {
+			excluded := false
+			for _, s := range constants.SupportedShells {
+				if cmd == s {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				return nil // Agent has started (pane is no longer running a shell)
+			}
+		}
+		time.Sleep(delay)
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	return fmt.Errorf("timeout waiting for agent to start (tried for %v)", timeout)
 }
 
 // detectCloneRoot finds the root of the current git clone.
@@ -568,26 +622,22 @@ func wakeRigAgents(rigName string) {
 		}
 	}
 
-	// Queue nudge to witness for cooperative delivery.
-	// This avoids interrupting in-flight tool calls.
+	// Immediate delivery to witness: send directly to tmux pane.
+	// No cooperative queue — idle agents never call Drain(), so queued
+	// nudges would be stuck forever. Direct delivery is safe: if the
+	// agent is busy, text buffers in tmux and is processed at next prompt.
 	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-	if townRoot != "" {
-		if err := nudge.Enqueue(townRoot, witnessSession, nudge.QueuedNudge{
-			Sender:  "sling",
-			Message: "Polecat dispatched - check for work",
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to queue nudge for %s: %v\n", witnessSession, err)
-		}
-	} else {
-		// Fallback to direct nudge if town root unavailable
-		t := tmux.NewTmux()
-		_ = t.NudgeSession(witnessSession, "Polecat dispatched - check for work")
+	t := tmux.NewTmux()
+	if err := t.NudgeSession(witnessSession, "Polecat dispatched - check for work"); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to nudge witness %s: %v\n", witnessSession, err)
 	}
 }
 
-// nudgeRefinery queues a nudge for the refinery after an MR is created.
-// Uses the nudge queue for cooperative delivery so we don't interrupt
-// in-flight tool calls. The refinery picks this up at its next turn boundary.
+// nudgeRefinery wakes the refinery after an MR is created.
+// Uses immediate delivery: sends directly to the tmux pane.
+// No cooperative queue — idle agents never call Drain(), so queued
+// nudges would be stuck forever. Direct delivery is safe: if the
+// agent is busy, text buffers in tmux and is processed at next prompt.
 func nudgeRefinery(rigName, message string) {
 	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
 
@@ -602,19 +652,9 @@ func nudgeRefinery(rigName, message string) {
 		return // Don't actually nudge tmux in tests
 	}
 
-	// Queue for cooperative delivery at refinery's next turn boundary
-	townRoot, _ := workspace.FindFromCwd()
-	if townRoot != "" {
-		if err := nudge.Enqueue(townRoot, refinerySession, nudge.QueuedNudge{
-			Sender:  "sling",
-			Message: message,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to queue nudge for %s: %v\n", refinerySession, err)
-		}
-	} else {
-		// Fallback to direct nudge if town root unavailable
-		t := tmux.NewTmux()
-		_ = t.NudgeSession(refinerySession, message)
+	t := tmux.NewTmux()
+	if err := t.NudgeSession(refinerySession, message); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to nudge refinery %s: %v\n", refinerySession, err)
 	}
 }
 

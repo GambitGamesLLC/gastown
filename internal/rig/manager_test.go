@@ -452,7 +452,7 @@ exit 1
 	if err != nil {
 		t.Fatalf("reading config.yaml: %v", err)
 	}
-	want := "prefix: gt\nissue-prefix: gt\n"
+	want := "prefix: gt\nissue-prefix: gt\nsync.mode: dolt-native\n"
 	if string(config) != want {
 		t.Fatalf("config.yaml = %q, want %q", string(config), want)
 	}
@@ -498,6 +498,10 @@ exit 0
 	// Verify bd config set issue_prefix was called with the correct prefix
 	if !strings.Contains(cmds, "config set issue_prefix myrig") {
 		t.Errorf("expected 'bd config set issue_prefix myrig' in commands log, got:\n%s", cmds)
+	}
+	// Verify sync mode is explicitly set to dolt-native for new rig beads.
+	if !strings.Contains(cmds, "config set sync.mode dolt-native") {
+		t.Errorf("expected 'bd config set sync.mode dolt-native' in commands log, got:\n%s", cmds)
 	}
 }
 
@@ -555,13 +559,16 @@ case "$cmd" in
   config)
     # Accept config commands (e.g., "bd config set types.custom ...")
     ;;
+  init)
+    # Accept init commands (e.g., "bd init --prefix gt --server")
+    ;;
   *)
     echo "unexpected command: $cmd" >&2
     exit 1
     ;;
 esac
 `
-	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" exit /b 0\r\nexit /b 1\r\n"
+	windowsScript := "@echo off\r\nsetlocal enabledelayedexpansion\r\nif defined BEADS_DIR_LOG (\r\n  if defined BEADS_DIR (\r\n    echo %BEADS_DIR%>>\"%BEADS_DIR_LOG%\"\r\n  ) else (\r\n    echo ^<unset^> >>\"%BEADS_DIR_LOG%\"\r\n  )\r\n)\r\nset \"cmd=%1\"\r\nset \"arg2=%2\"\r\nset \"arg3=%3\"\r\nif \"%cmd%\"==\"--allow-stale\" (\r\n  set \"cmd=%2\"\r\n  set \"arg2=%3\"\r\n  set \"arg3=%4\"\r\n)\r\nif \"%cmd%\"==\"show\" (\r\n  echo []\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"create\" (\r\n  set \"id=\"\r\n  set \"title=\"\r\n  for %%A in (%*) do (\r\n    set \"arg=%%~A\"\r\n    if /i \"!arg:~0,5!\"==\"--id=\" set \"id=!arg:~5!\"\r\n    if /i \"!arg:~0,8!\"==\"--title=\" set \"title=!arg:~8!\"\r\n  )\r\n  if defined AGENT_LOG (\r\n    echo !id!>>\"%AGENT_LOG%\"\r\n  )\r\n  echo {\"id\":\"!id!\",\"title\":\"!title!\",\"description\":\"\",\"issue_type\":\"agent\"}\r\n  exit /b 0\r\n)\r\nif \"%cmd%\"==\"slot\" exit /b 0\r\nif \"%cmd%\"==\"config\" exit /b 0\r\nif \"%cmd%\"==\"init\" exit /b 0\r\nexit /b 1\r\n"
 
 	binDir := writeFakeBD(t, script, windowsScript)
 	agentLog := filepath.Join(t.TempDir(), "agents.log")
@@ -909,6 +916,23 @@ func TestDetectBeadsPrefixFromConfig_FallbackIssuesJSONL(t *testing.T) {
 {"id":"gt-abc12","title":"regular"}
 {"id":"gt-xyz99","title":"regular"}`,
 			want: "gt",
+		},
+		{
+			// Regression: GH #591 - 3-char polecat names (nux, ace, max) were
+			// misdetected as prefix "gt-gastown-polecat" before the fix.
+			name: "3-char polecat name does not corrupt prefix detection",
+			issuesJSON: `{"id":"gt-gastown-polecat-nux","title":"agent"}
+{"id":"gt-gastown-polecat-ace","title":"agent"}
+{"id":"gt-gastown-polecat-max","title":"agent"}
+{"id":"gt-abc12","title":"regular"}`,
+			want: "gt",
+		},
+		{
+			// When ONLY 3-char polecat agent beads exist, prefix cannot be detected.
+			name: "only 3-char polecat agent beads returns empty prefix",
+			issuesJSON: `{"id":"gt-gastown-polecat-nux","title":"agent"}
+{"id":"gt-gastown-polecat-ace","title":"agent"}`,
+			want: "",
 		},
 	}
 

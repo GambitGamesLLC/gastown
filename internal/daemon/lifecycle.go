@@ -495,11 +495,12 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 			sessionIDEnv = runtimeConfig.Session.SessionIDEnv
 		}
 		envVars := config.AgentEnv(config.AgentEnvConfig{
-			Role:         "polecat",
-			Rig:          parsed.RigName,
-			AgentName:    parsed.AgentName,
-			TownRoot:     d.config.TownRoot,
-			SessionIDEnv: sessionIDEnv,
+			Role:          "polecat",
+			Rig:           parsed.RigName,
+			AgentName:     parsed.AgentName,
+			TownRoot:      d.config.TownRoot,
+			SessionIDEnv:  sessionIDEnv,
+			ResolvedAgent: runtimeConfig.ResolvedAgent,
 		})
 		config.SanitizeAgentEnv(envVars, map[string]string{})
 		return config.PrependEnv("exec "+runtimeConfig.BuildCommandWithPrompt(prompt), envVars)
@@ -511,11 +512,12 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 			sessionIDEnv = runtimeConfig.Session.SessionIDEnv
 		}
 		envVars := config.AgentEnv(config.AgentEnvConfig{
-			Role:         "crew",
-			Rig:          parsed.RigName,
-			AgentName:    parsed.AgentName,
-			TownRoot:     d.config.TownRoot,
-			SessionIDEnv: sessionIDEnv,
+			Role:          "crew",
+			Rig:           parsed.RigName,
+			AgentName:     parsed.AgentName,
+			TownRoot:      d.config.TownRoot,
+			SessionIDEnv:  sessionIDEnv,
+			ResolvedAgent: runtimeConfig.ResolvedAgent,
 		})
 		config.SanitizeAgentEnv(envVars, map[string]string{})
 		return config.PrependEnv("exec "+runtimeConfig.BuildCommandWithPrompt(prompt), envVars)
@@ -527,12 +529,20 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 // setSessionEnvironment sets environment variables for the tmux session.
 // Uses centralized AgentEnv for consistency, plus custom env vars from role config if available.
 func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.RoleConfig, parsed *ParsedIdentity) {
+	// Resolve agent config for ResolvedAgent fallback (ensures GT_AGENT in tmux session table).
+	rigPath := ""
+	if parsed.RigName != "" {
+		rigPath = filepath.Join(d.config.TownRoot, parsed.RigName)
+	}
+	rc := config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath)
+
 	// Use centralized AgentEnv for base environment variables
 	envVars := config.AgentEnv(config.AgentEnvConfig{
-		Role:      parsed.RoleType,
-		Rig:       parsed.RigName,
-		AgentName: parsed.AgentName,
-		TownRoot:  d.config.TownRoot,
+		Role:          parsed.RoleType,
+		Rig:           parsed.RigName,
+		AgentName:     parsed.AgentName,
+		TownRoot:      d.config.TownRoot,
+		ResolvedAgent: rc.ResolvedAgent,
 	})
 	for k, v := range envVars {
 		_ = d.tmux.SetEnvironment(sessionName, k, v)
@@ -723,8 +733,8 @@ func (d *Daemon) closeMessage(id string) error {
 type AgentBeadInfo struct {
 	ID         string `json:"id"`
 	Type       string `json:"issue_type"`
-	State      string // Parsed from description: agent_state
-	HookBead   string // Parsed from description: hook_bead
+	State      string // From DB column (agent_state), fallback to description
+	HookBead   string // From DB column (hook_bead)
 	RoleType   string // Parsed from description: role_type
 	Rig        string // Parsed from description: rig
 	LastUpdate string `json:"updated_at"`
@@ -796,9 +806,18 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 	}
 
 	if fields != nil {
-		info.State = fields.AgentState
 		info.RoleType = fields.RoleType
 		info.Rig = fields.Rig
+	}
+
+	// Use AgentState from database column directly (not from description).
+	// UpdateAgentState updates the DB column but not the description text,
+	// so the description can contain stale state (e.g., "spawning" after
+	// the polecat has transitioned to "working"). Fall back to description
+	// only if the DB column is empty (legacy beads).
+	info.State = issue.AgentState
+	if info.State == "" && fields != nil {
+		info.State = fields.AgentState
 	}
 
 	// Use HookBead from database column directly (not from description)

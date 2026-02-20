@@ -544,6 +544,22 @@ func (t *Tmux) KillPaneProcessesExcluding(pane string, excludePIDs []string) err
 	// Get all descendant PIDs recursively (returns deepest-first order)
 	descendants := getAllDescendants(pid)
 
+	// Build known PID set for group membership verification
+	knownPIDs := make(map[string]bool, len(descendants)+1)
+	knownPIDs[pid] = true
+	for _, d := range descendants {
+		knownPIDs[d] = true
+	}
+
+	// Find reparented processes from our process group (matches KillPaneProcesses
+	// and KillSessionWithProcesses). Processes that called setsid() and reparented
+	// to init would otherwise be missed by the descendant walk.
+	pgid := getProcessGroupID(pid)
+	if pgid != "" && pgid != "0" && pgid != "1" {
+		reparented := collectReparentedGroupMembers(pgid, knownPIDs)
+		descendants = append(descendants, reparented...)
+	}
+
 	// Filter out excluded PIDs
 	var filtered []string
 	for _, dpid := range descendants {
@@ -557,8 +573,9 @@ func (t *Tmux) KillPaneProcessesExcluding(pane string, excludePIDs []string) err
 		_ = exec.Command("kill", "-TERM", dpid).Run()
 	}
 
-	// Wait for graceful shutdown
-	time.Sleep(100 * time.Millisecond)
+	// Wait for graceful shutdown (2s matches processKillGracePeriod used by
+	// KillPaneProcesses and KillSessionWithProcesses)
+	time.Sleep(processKillGracePeriod)
 
 	// Send SIGKILL to any remaining non-excluded descendants
 	for _, dpid := range filtered {
@@ -568,7 +585,7 @@ func (t *Tmux) KillPaneProcessesExcluding(pane string, excludePIDs []string) err
 	// Kill the pane process itself only if not excluded
 	if !exclude[pid] {
 		_ = exec.Command("kill", "-TERM", pid).Run()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(processKillGracePeriod)
 		_ = exec.Command("kill", "-KILL", pid).Run()
 	}
 
@@ -1125,8 +1142,7 @@ func (t *Tmux) FindAgentPane(session string) (string, error) {
 	}
 
 	// Get agent process names from session environment
-	agentName, _ := t.GetEnvironment(session, "GT_AGENT")
-	processNames := config.GetProcessNames(agentName)
+	processNames := t.resolveSessionProcessNames(session)
 
 	// Check each pane for agent process
 	for _, line := range lines {
@@ -1611,13 +1627,24 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 }
 
 // IsAgentAlive checks if an agent is running in the session using agent-agnostic detection.
-// It reads GT_AGENT from the session environment to determine which process names to check.
-// Falls back to Claude's process names if GT_AGENT is not set (legacy sessions).
+// It reads GT_PROCESS_NAMES from the session environment for accurate process detection,
+// falling back to GT_AGENT-based lookup for legacy sessions.
 // This is the preferred method for zombie detection across all agent types.
 func (t *Tmux) IsAgentAlive(session string) bool {
+	return t.IsRuntimeRunning(session, t.resolveSessionProcessNames(session))
+}
+
+// resolveSessionProcessNames returns the process names to check for a session.
+// Prefers GT_PROCESS_NAMES (set at startup, handles custom agents that shadow
+// built-in presets). Falls back to GT_AGENT-based lookup for legacy sessions.
+func (t *Tmux) resolveSessionProcessNames(session string) []string {
+	// Prefer explicit process names set at startup (handles custom agents correctly)
+	if names, err := t.GetEnvironment(session, "GT_PROCESS_NAMES"); err == nil && names != "" {
+		return strings.Split(names, ",")
+	}
+	// Fallback: resolve from agent name (built-in presets only)
 	agentName, _ := t.GetEnvironment(session, "GT_AGENT")
-	processNames := config.GetProcessNames(agentName) // Returns Claude defaults if empty
-	return t.IsRuntimeRunning(session, processNames)
+	return config.GetProcessNames(agentName) // Returns Claude defaults if empty
 }
 
 // WaitForCommand polls until the pane is NOT running one of the excluded commands.

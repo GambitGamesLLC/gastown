@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -363,6 +364,73 @@ func TestSessionManager_resolveBeadsDir(t *testing.T) {
 			if resolved != tc.expectedDir {
 				t.Errorf("resolveBeadsDir(%q, %q) = %q, want %q",
 					tc.issueID, polecatWorkDir, resolved, tc.expectedDir)
+			}
+		})
+	}
+}
+
+// TestAgentEnvCentralizedFallback verifies that AgentEnv handles GT_AGENT
+// resolution centrally via the ResolvedAgent field, so callers no longer need
+// per-site fallback logic. This replaced the per-caller fallback that was
+// previously in session_manager.go (removed in gt-nwgd5).
+func TestAgentEnvCentralizedFallback(t *testing.T) {
+	t.Parallel()
+
+	// Simulate what session_manager.Start calls for each dispatch scenario.
+	cases := []struct {
+		name          string
+		agent         string // opts.Agent value (explicit override)
+		resolvedAgent string // runtimeConfig.ResolvedAgent
+		wantGTAgent   string // expected GT_AGENT value ("" = absent)
+	}{
+		{
+			name:          "default dispatch with resolved agent",
+			agent:         "",
+			resolvedAgent: "codex",
+			wantGTAgent:   "codex", // centralized fallback
+		},
+		{
+			name:          "default dispatch without resolved agent (Claude default)",
+			agent:         "",
+			resolvedAgent: "",
+			wantGTAgent:   "", // absent — Claude default needs no GT_AGENT
+		},
+		{
+			name:          "explicit --agent codex",
+			agent:         "codex",
+			resolvedAgent: "gemini", // override takes precedence
+			wantGTAgent:   "codex",
+		},
+		{
+			name:          "explicit --agent gemini",
+			agent:         "gemini",
+			resolvedAgent: "",
+			wantGTAgent:   "gemini",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := config.AgentEnv(config.AgentEnvConfig{
+				Role:          "polecat",
+				Rig:           "gastown",
+				AgentName:     "Toast",
+				TownRoot:      "/tmp/town",
+				Agent:         tc.agent,
+				ResolvedAgent: tc.resolvedAgent,
+			})
+			got, hasGTAgent := env["GT_AGENT"]
+			if tc.wantGTAgent == "" {
+				if hasGTAgent {
+					t.Errorf("AgentEnv(Agent=%q, ResolvedAgent=%q): GT_AGENT present=%q, want absent",
+						tc.agent, tc.resolvedAgent, got)
+				}
+			} else {
+				if !hasGTAgent || got != tc.wantGTAgent {
+					t.Errorf("AgentEnv(Agent=%q, ResolvedAgent=%q): GT_AGENT=%q, want %q",
+						tc.agent, tc.resolvedAgent, got, tc.wantGTAgent)
+				}
 			}
 		})
 	}

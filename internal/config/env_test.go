@@ -173,6 +173,273 @@ func TestAgentEnv_EmptyTownRootOmitted(t *testing.T) {
 	assertEnv(t, env, "GT_RIG", "myrig")
 }
 
+func TestAgentEnv_WithAgentOverride(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:      "polecat",
+		Rig:       "myrig",
+		AgentName: "Toast",
+		TownRoot:  "/town",
+		Agent:     "codex",
+	})
+
+	assertEnv(t, env, "GT_AGENT", "codex")
+}
+
+func TestAgentEnv_WithoutAgentOverride(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:      "polecat",
+		Rig:       "myrig",
+		AgentName: "Toast",
+		TownRoot:  "/town",
+	})
+
+	assertNotSet(t, env, "GT_AGENT")
+}
+
+// TestAgentEnv_WithoutAgentOverride_UsesResolvedAgent verifies that AgentEnv
+// uses ResolvedAgent as fallback when Agent (explicit --agent override) is empty.
+// This centralizes GT_AGENT resolution in AgentEnv, eliminating the need for
+// per-caller fallback logic (previously in session_manager.go, daemon.go).
+// Fix for gt-nwgd5: non-polecat roles had GT_AGENT missing from tmux session table.
+func TestAgentEnv_WithoutAgentOverride_UsesResolvedAgent(t *testing.T) {
+	t.Parallel()
+
+	// Simulate the default polecat dispatch path (no --agent flag)
+	// with a resolved agent from config.
+	env := AgentEnv(AgentEnvConfig{
+		Role:          "polecat",
+		Rig:           "myrig",
+		AgentName:     "Toast",
+		TownRoot:      "/town",
+		Agent:         "",       // no explicit override
+		ResolvedAgent: "codex",  // resolved from rig/town config
+	})
+
+	// GT_AGENT IS set from ResolvedAgent — no caller fallback needed.
+	assertEnv(t, env, "GT_AGENT", "codex")
+
+	// Without ResolvedAgent, GT_AGENT is absent (Claude default).
+	envNoResolved := AgentEnv(AgentEnvConfig{
+		Role:      "polecat",
+		Rig:       "myrig",
+		AgentName: "Toast",
+		TownRoot:  "/town",
+		Agent:     "",
+	})
+	assertNotSet(t, envNoResolved, "GT_AGENT")
+
+	// With an explicit override, GT_AGENT uses the override (not ResolvedAgent).
+	envWithOverride := AgentEnv(AgentEnvConfig{
+		Role:          "polecat",
+		Rig:           "myrig",
+		AgentName:     "Toast",
+		TownRoot:      "/town",
+		Agent:         "gemini",
+		ResolvedAgent: "codex",
+	})
+	assertEnv(t, envWithOverride, "GT_AGENT", "gemini")
+}
+
+// TestAgentEnv_AgentOverrideAllRoles verifies that GT_AGENT is emitted for
+// every role that supports agent overrides. This mirrors the actual
+// AgentEnvConfig constructions in each manager's Start method.
+func TestAgentEnv_AgentOverrideAllRoles(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		cfg  AgentEnvConfig
+	}{
+		{
+			name: "polecat via session_manager",
+			cfg: AgentEnvConfig{
+				Role:      "polecat",
+				Rig:       "rig1",
+				AgentName: "Toast",
+				TownRoot:  "/town",
+				Agent:     "codex",
+			},
+		},
+		{
+			name: "witness",
+			cfg: AgentEnvConfig{
+				Role:     "witness",
+				Rig:      "rig1",
+				TownRoot: "/town",
+				Agent:    "gemini",
+			},
+		},
+		{
+			name: "refinery",
+			cfg: AgentEnvConfig{
+				Role:     "refinery",
+				Rig:      "rig1",
+				TownRoot: "/town",
+				Agent:    "codex",
+			},
+		},
+		{
+			name: "deacon",
+			cfg: AgentEnvConfig{
+				Role:     "deacon",
+				TownRoot: "/town",
+				Agent:    "gemini",
+			},
+		},
+		{
+			name: "crew",
+			cfg: AgentEnvConfig{
+				Role:             "crew",
+				Rig:              "rig1",
+				AgentName:        "worker1",
+				TownRoot:         "/town",
+				RuntimeConfigDir: "/config",
+				Agent:            "codex",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := AgentEnv(tc.cfg)
+			assertEnv(t, env, "GT_AGENT", tc.cfg.Agent)
+		})
+	}
+}
+
+// TestAgentEnv_NoAgentOverrideOmitsKey verifies GT_AGENT is absent when
+// both Agent and ResolvedAgent are empty, for all roles.
+func TestAgentEnv_NoAgentOverrideOmitsKey(t *testing.T) {
+	t.Parallel()
+	roles := []string{"polecat", "witness", "refinery", "deacon", "crew"}
+	for _, role := range roles {
+		t.Run(role, func(t *testing.T) {
+			t.Parallel()
+			env := AgentEnv(AgentEnvConfig{
+				Role:     role,
+				TownRoot: "/town",
+			})
+			assertNotSet(t, env, "GT_AGENT")
+		})
+	}
+}
+
+// TestAgentEnv_ResolvedAgentFallback verifies that GT_AGENT is set from
+// ResolvedAgent when Agent (explicit --agent override) is empty.
+// This fixes the bug where non-polecat roles (Witness, Refinery, Crew, Deacon)
+// had GT_AGENT missing from the tmux session table on the default dispatch path.
+func TestAgentEnv_ResolvedAgentFallback(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:          "witness",
+		Rig:           "myrig",
+		TownRoot:      "/town",
+		Agent:         "",       // no explicit override
+		ResolvedAgent: "codex",  // resolved from config
+	})
+
+	// GT_AGENT should be set from ResolvedAgent fallback
+	assertEnv(t, env, "GT_AGENT", "codex")
+}
+
+// TestAgentEnv_AgentOverrideTakesPrecedenceOverResolved verifies that an
+// explicit Agent override takes precedence over ResolvedAgent.
+func TestAgentEnv_AgentOverrideTakesPrecedenceOverResolved(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:          "polecat",
+		Rig:           "myrig",
+		AgentName:     "Toast",
+		TownRoot:      "/town",
+		Agent:         "gemini",  // explicit override
+		ResolvedAgent: "codex",   // resolved from config (should be ignored)
+	})
+
+	// Agent override takes precedence
+	assertEnv(t, env, "GT_AGENT", "gemini")
+}
+
+// TestAgentEnv_ResolvedAgentFallbackAllRoles verifies that GT_AGENT is set
+// from ResolvedAgent for every role that supports agent overrides.
+// This is the fix for gt-nwgd5: non-polecat roles had GT_AGENT missing.
+func TestAgentEnv_ResolvedAgentFallbackAllRoles(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		cfg  AgentEnvConfig
+	}{
+		{
+			name: "polecat",
+			cfg: AgentEnvConfig{
+				Role:          "polecat",
+				Rig:           "rig1",
+				AgentName:     "Toast",
+				TownRoot:      "/town",
+				ResolvedAgent: "codex",
+			},
+		},
+		{
+			name: "witness",
+			cfg: AgentEnvConfig{
+				Role:          "witness",
+				Rig:           "rig1",
+				TownRoot:      "/town",
+				ResolvedAgent: "gemini",
+			},
+		},
+		{
+			name: "refinery",
+			cfg: AgentEnvConfig{
+				Role:          "refinery",
+				Rig:           "rig1",
+				TownRoot:      "/town",
+				ResolvedAgent: "codex",
+			},
+		},
+		{
+			name: "deacon",
+			cfg: AgentEnvConfig{
+				Role:          "deacon",
+				TownRoot:      "/town",
+				ResolvedAgent: "gemini",
+			},
+		},
+		{
+			name: "crew",
+			cfg: AgentEnvConfig{
+				Role:             "crew",
+				Rig:              "rig1",
+				AgentName:        "worker1",
+				TownRoot:         "/town",
+				RuntimeConfigDir: "/config",
+				ResolvedAgent:    "codex",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := AgentEnv(tc.cfg)
+			assertEnv(t, env, "GT_AGENT", tc.cfg.ResolvedAgent)
+		})
+	}
+}
+
+// TestAgentEnv_EmptyResolvedAgentOmitsKey verifies GT_AGENT is absent when
+// both Agent and ResolvedAgent are empty (Claude default — no GT_AGENT needed).
+func TestAgentEnv_EmptyResolvedAgentOmitsKey(t *testing.T) {
+	t.Parallel()
+	env := AgentEnv(AgentEnvConfig{
+		Role:          "witness",
+		Rig:           "myrig",
+		TownRoot:      "/town",
+		Agent:         "",
+		ResolvedAgent: "",
+	})
+	assertNotSet(t, env, "GT_AGENT")
+}
+
 func TestShellQuote(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
