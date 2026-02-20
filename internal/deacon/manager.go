@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -126,6 +127,11 @@ func (m *Manager) Start(agentOverride string) error {
 		Role:     "deacon",
 		TownRoot: m.townRoot,
 	})
+	// FIX: GT_PROCESS_NAMES must be set for correct IsAgentAlive detection
+	// when using non-Claude agents (opencode, codex, etc.)
+	// See: https://github.com/steveyegge/gastown/issues/1808
+	processNames := config.GetProcessNames(runtimeConfig.ResolvedAgent)
+	envVars["GT_PROCESS_NAMES"] = strings.Join(processNames, ",")
 	for k, v := range envVars {
 		_ = t.SetEnvironment(sessionID, k, v)
 	}
