@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "gambit_gastown",
+  "project_id": "ba238f1d-ca49-4f7e-9a84-aa4f16f1a10c"
+}
